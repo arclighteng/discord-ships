@@ -30,7 +30,8 @@ const client = new Client({
 const easypost = new EasyPost(process.env.EASYPOST_API_KEY);
 
 // Initialize Shippo
-const shippo = require('shippo')(process.env.SHIPPO_API_KEY);
+const { Shippo } = require('shippo');
+const shippo = new Shippo({ apiKeyHeader: process.env.SHIPPO_API_KEY });
 
 // Store active label creation sessions
 const sessions = new Map();
@@ -51,7 +52,7 @@ const STEPS = {
 };
 
 // Bot ready event
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`✅ Bot logged in as ${client.user.tag}`);
   console.log('Ready to create labels!');
 });
@@ -70,7 +71,7 @@ client.on('messageCreate', async (message) => {
       step: STEPS.NAME,
       data: {},
     });
-    message.reply('📦 Let\'s create a shipping label!\n\n**What is the recipient\'s name?**');
+    message.reply('📦 Let\'s create a shipping label! Type `!cancel` to abort the process.\n\n**What is the recipient\'s name?**');
     return;
   }
 
@@ -281,7 +282,7 @@ async function getRatesAndPrompt(message, session) {
           weight: data.weight,
         },
       }),
-      shippo.shipment.create({
+      shippo.shipments.create({
         address_from: {
           name:    process.env.FROM_NAME,
           street1: process.env.FROM_STREET,
@@ -333,7 +334,7 @@ async function getRatesAndPrompt(message, session) {
             _rawRate:      r,
             _displayPrice: r.amount,
             _service:      r.servicelevel.name,
-            _days:         r.estimated_days,
+            _days:         r.estimatedDays,
           }))
       : [];
 
@@ -386,16 +387,16 @@ async function createLabel(message, data, selectedRate) {
 
     } else {
       const raw = selectedRate._rawRate;
-      const tx  = await shippo.transaction.create({
-        rate:            raw.object_id,
-        label_file_type: 'PDF',
-        async:           false,
+      const tx  = await shippo.transactions.create({
+        rate:          raw.objectId,
+        labelFileType: 'PDF',
+        async:         false,
       });
       if (tx.status !== 'SUCCESS') {
         throw new Error(`Label generation failed: ${JSON.stringify(tx.messages)}`);
       }
-      labelUrl     = tx.label_url;
-      trackingCode = tx.tracking_number;
+      labelUrl     = tx.labelUrl;
+      trackingCode = tx.trackingNumber;
     }
 
     const stats = loadStats();
