@@ -1,6 +1,21 @@
 const { Client, GatewayIntentBits } = require('discord.js');
 const EasyPost = require('@easypost/api');
+const fs = require('fs');
 require('dotenv').config();
+
+const STATS_FILE = 'stats.json';
+
+function loadStats() {
+  try {
+    return JSON.parse(fs.readFileSync(STATS_FILE, 'utf8'));
+  } catch {
+    return { totalPackages: 0, byService: {}, byRecipient: {} };
+  }
+}
+
+function saveStats(stats) {
+  fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
+}
 
 // Initialize Discord client
 const client = new Client({
@@ -13,6 +28,9 @@ const client = new Client({
 
 // Initialize EasyPost
 const easypost = new EasyPost(process.env.EASYPOST_API_KEY);
+
+// Initialize Shippo
+const shippo = require('shippo')(process.env.SHIPPO_API_KEY);
 
 // Store active label creation sessions
 const sessions = new Map();
@@ -53,6 +71,34 @@ client.on('messageCreate', async (message) => {
       data: {},
     });
     message.reply('📦 Let\'s create a shipping label!\n\n**What is the recipient\'s name?**');
+    return;
+  }
+
+  // Stats command
+  if (content.toLowerCase() === '!stats') {
+    const stats = loadStats();
+
+    if (stats.totalPackages === 0) {
+      message.reply('📦 No labels have been created yet.');
+      return;
+    }
+
+    const byService = Object.entries(stats.byService)
+      .sort((a, b) => b[1] - a[1])
+      .map(([service, count]) => `  ${service}: **${count}**`)
+      .join('\n');
+
+    const byRecipient = Object.entries(stats.byRecipient)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, count]) => `  ${name}: **${count}**`)
+      .join('\n');
+
+    message.reply(
+      `📊 **Shipping Stats**\n\n` +
+      `**Total Labels:** ${stats.totalPackages}\n\n` +
+      `**By Service:**\n${byService}\n\n` +
+      `**By Recipient:**\n${byRecipient}`
+    );
     return;
   }
 
@@ -191,8 +237,8 @@ async function handleStep(message, session, content) {
 }
 
 function buildSummary(data) {
-  const deliveryDays = data.selectedRate.delivery_days ? ` (${data.selectedRate.delivery_days} days)` : '';
-  
+  const deliveryDays = data.selectedRate._days ? ` (${data.selectedRate._days} days)` : '';
+
   return `📋 **SHIPPING LABEL SUMMARY**\n\n` +
     `**📍 Ship To:**\n` +
     `${data.name}\n` +
@@ -202,58 +248,122 @@ function buildSummary(data) {
     `Weight: ${data.weight} lbs\n` +
     `Dimensions: ${data.length}" × ${data.width}" × ${data.height}"\n\n` +
     `**🚚 Shipping Service:**\n` +
-    `${data.selectedRate.service}${deliveryDays}\n\n` +
-    `**💰 Total Cost: ${data.selectedRate.rate}**`;
+    `${data.selectedRate._service}${deliveryDays}\n\n` +
+    `**💰 Total Cost: $${data.selectedRate._displayPrice}**`;
 }
 
 async function getRatesAndPrompt(message, session) {
   const { data } = session;
 
   try {
-    // Create shipment to get rates (but don't buy yet)
-    const shipment = await easypost.Shipment.create({
-      from_address: {
-        name: process.env.FROM_NAME,
-        street1: process.env.FROM_STREET,
-        city: process.env.FROM_CITY,
-        state: process.env.FROM_STATE,
-        zip: process.env.FROM_ZIP,
-        phone: process.env.FROM_PHONE || '',
-      },
-      to_address: {
-        name: data.name,
-        street1: data.street,
-        city: data.city,
-        state: data.state,
-        zip: data.zip,
-      },
-      parcel: {
-        length: data.length,
-        width: data.width,
-        height: data.height,
-        weight: data.weight,
-      },
-    });
+    // Fetch from both APIs in parallel; don't let one failure kill the other
+    const [epResult, spResult] = await Promise.allSettled([
+      easypost.Shipment.create({
+        from_address: {
+          name:    process.env.FROM_NAME,
+          street1: process.env.FROM_STREET,
+          city:    process.env.FROM_CITY,
+          state:   process.env.FROM_STATE,
+          zip:     process.env.FROM_ZIP,
+          phone:   process.env.FROM_PHONE || '',
+        },
+        to_address: {
+          name:    data.name,
+          street1: data.street,
+          city:    data.city,
+          state:   data.state,
+          zip:     data.zip,
+        },
+        parcel: {
+          length: data.length,
+          width:  data.width,
+          height: data.height,
+          weight: data.weight,
+        },
+      }),
+      shippo.shipment.create({
+        address_from: {
+          name:    process.env.FROM_NAME,
+          street1: process.env.FROM_STREET,
+          city:    process.env.FROM_CITY,
+          state:   process.env.FROM_STATE,
+          zip:     process.env.FROM_ZIP,
+          country: 'US',
+          phone:   process.env.FROM_PHONE || '',
+        },
+        address_to: {
+          name:    data.name,
+          street1: data.street,
+          city:    data.city,
+          state:   data.state,
+          zip:     data.zip,
+          country: 'US',
+        },
+        parcels: [{
+          length:        String(data.length),
+          width:         String(data.width),
+          height:        String(data.height),
+          distance_unit: 'in',
+          weight:        String(data.weight),
+          mass_unit:     'lb',
+        }],
+        async: false,
+      }),
+    ]);
 
-    // Filter for USPS rates only
-    const uspsRates = shipment.rates.filter(r => r.carrier === 'USPS');
+    // Normalize EasyPost rates
+    const epRates = epResult.status === 'fulfilled'
+      ? epResult.value.rates
+          .filter(r => r.carrier === 'USPS')
+          .map(r => ({
+            _source:       'easypost',
+            _rawRate:      r,
+            _displayPrice: r.rate,
+            _service:      r.service,
+            _days:         r.delivery_days,
+          }))
+      : [];
 
-    if (uspsRates.length === 0) {
-      throw new Error('No USPS rates available for this shipment.');
+    // Normalize Shippo rates
+    const spRates = spResult.status === 'fulfilled'
+      ? spResult.value.rates
+          .filter(r => r.provider === 'USPS')
+          .map(r => ({
+            _source:       'shippo',
+            _rawRate:      r,
+            _displayPrice: r.amount,
+            _service:      r.servicelevel.name,
+            _days:         r.estimated_days,
+          }))
+      : [];
+
+    // Sort by price, then deduplicate by service name keeping the cheapest
+    const seen = new Set();
+    const allRates = [...epRates, ...spRates]
+      .sort((a, b) => parseFloat(a._displayPrice) - parseFloat(b._displayPrice))
+      .filter(r => {
+        if (seen.has(r._service)) return false;
+        seen.add(r._service);
+        return true;
+      });
+
+    if (allRates.length === 0) {
+      throw new Error('No USPS rates available from either provider.');
     }
 
-    // Store shipment and rates in session
-    data.shipment = shipment;
-    data.rates = uspsRates;
+    // Store shipment refs for purchase routing later
+    if (epResult.status === 'fulfilled') data.easypostShipment = epResult.value;
+    if (spResult.status === 'fulfilled') data.shippoShipment   = spResult.value;
+    data.rates = allRates;
     session.step = STEPS.SELECT_RATE;
 
     // Build rate selection message
     let rateMessage = '📋 **Available USPS shipping options:**\n\n';
-    uspsRates.forEach((rate, index) => {
-      const deliveryDays = rate.delivery_days ? ` (${rate.delivery_days} days)` : '';
-      rateMessage += `**${index + 1}.** ${rate.service} - **$${rate.rate}**${deliveryDays}\n`;
+    allRates.forEach((rate, index) => {
+      const days = rate._days ? ` (${rate._days} days)` : '';
+      rateMessage += `**${index + 1}.** ${rate._service} - **$${rate._displayPrice}**${days}\n`;
     });
-    rateMessage += '\n**Reply with the number of your choice** (e.g., type `1` for the first option)';
+    rateMessage += '\n**Reply with the number of your choice**';
 
     message.reply(rateMessage);
 
@@ -266,32 +376,47 @@ async function getRatesAndPrompt(message, session) {
 
 async function createLabel(message, data, selectedRate) {
   try {
-    // Buy the shipment with the selected rate
-    const boughtShipment = await easypost.Shipment.buy(data.shipment.id, selectedRate.id);
+    let labelUrl, trackingCode;
 
-    // Get the label URL
-    const labelUrl = boughtShipment.postage_label.label_url;
+    if (selectedRate._source === 'easypost') {
+      const raw = selectedRate._rawRate;
+      const bought = await easypost.Shipment.buy(data.easypostShipment.id, raw.id);
+      labelUrl     = bought.postage_label.label_url;
+      trackingCode = bought.tracking_code;
 
-    // Send success message with tracking
+    } else {
+      const raw = selectedRate._rawRate;
+      const tx  = await shippo.transaction.create({
+        rate:            raw.object_id,
+        label_file_type: 'PDF',
+        async:           false,
+      });
+      if (tx.status !== 'SUCCESS') {
+        throw new Error(`Label generation failed: ${JSON.stringify(tx.messages)}`);
+      }
+      labelUrl     = tx.label_url;
+      trackingCode = tx.tracking_number;
+    }
+
+    const stats = loadStats();
+    stats.totalPackages++;
+    stats.byService[selectedRate._service] = (stats.byService[selectedRate._service] || 0) + 1;
+    stats.byRecipient[data.name] = (stats.byRecipient[data.name] || 0) + 1;
+    saveStats(stats);
+
     await message.reply(
       `✅ **Label created successfully!**\n\n` +
       `📍 To: ${data.name}, ${data.city}, ${data.state}\n` +
-      `📦 Service: ${selectedRate.service}\n` +
-      `🔢 Tracking: ${boughtShipment.tracking_code}\n` +
-      `💰 Cost: $${selectedRate.rate}\n\n` +
+      `📦 Service: ${selectedRate._service}\n` +
+      `🔢 Tracking: ${trackingCode}\n` +
+      `💰 Cost: $${selectedRate._displayPrice}\n\n` +
       `**Label PDF:** ${labelUrl}\n\n` +
       `Download and print the label from the link above.`
     );
 
   } catch (error) {
     console.error('Error creating label:', error);
-    
-    let errorMessage = 'Failed to create label.';
-    if (error.message) {
-      errorMessage += ' ' + error.message;
-    }
-    
-    message.reply(`❌ ${errorMessage}\n\nPlease check the details and try again with \`!label\``);
+    message.reply(`❌ Failed to create label: ${error.message}\n\nTry again with \`!label\``);
   }
 }
 

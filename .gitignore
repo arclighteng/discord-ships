@@ -1,6 +1,9 @@
 # Environment variables (contains secrets)
 .env
 
+# Shipping stats (contains customer names)
+stats.json
+
 # Dependencies
 node_modules/
 
